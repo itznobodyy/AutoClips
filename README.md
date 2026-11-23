@@ -30,6 +30,20 @@ Abre [http://127.0.0.1:8000](http://127.0.0.1:8000) en el navegador. Mantén abi
 
 > No abras `index.html` directamente como archivo: YouTube necesita que la página se sirva mediante HTTP para que el reproductor integrado funcione correctamente.
 
+## Comandos de producción
+
+Con GNU Make y SSH instalados en tu PC, puedes administrar un servidor ya configurado con el servicio `autoclips`:
+
+```sh
+make deploy HOST=root@tu-servidor
+make logs HOST=root@tu-servidor
+make logs HOST=root@tu-servidor SERVICE=pot
+make restart HOST=root@tu-servidor
+make cookies HOST=root@tu-servidor COOKIE_FILE=secrets/cookies.txt
+```
+
+`deploy` actualiza el checkout remoto y recarga el servicio; `cookies` instala el archivo con permisos privados y reinicia AutoClips. `secrets/` está excluido de Git. Estos comandos presuponen que el servidor ya tiene configurados Docker Compose y el servicio systemd de AutoClips.
+
 ## Estructura
 
 | Archivo | Descripción |

@@ -1,0 +1,27 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: 8080
+      POT_URL: http://pot:4416
+      COOKIES_FILE: /app/secrets/cookies.txt
+      MAX_JOBS: 2
+      MAX_DURATION_MIN: 120
+      MAX_CLIPS: 6
+      MAX_CLIPS_GB: 5
+      JOB_TTL_MIN: 120
+    volumes:
+      - ./secrets:/app/secrets:ro
+      - clips:/app/clips
+    depends_on:
+      - pot
+    restart: unless-stopped
+
+  pot:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    restart: unless-stopped
+
+volumes:
+  clips:

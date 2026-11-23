@@ -3,36 +3,66 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>AutoClips</title>
+  <meta name="description" content="Convierte un enlace de YouTube en clips listos para publicar." />
+  <meta name="theme-color" content="#0c0e16" />
+  <title>AutoClips — Del directo al clip</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap"
+    rel="stylesheet"
+  />
   <link rel="stylesheet" href="styles.css" />
   <script src="app.js" defer></script>
 </head>
 <body>
   <header class="top">
-    <div class="brand">auto<span>clips</span></div>
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32" fill="none">
+          <path d="M7 8.5a2 2 0 0 1 3-1.73l16 9.23a2 2 0 0 1 0 3.46l-16 9.23A2 2 0 0 1 7 26.96V8.5Z" fill="currentColor" />
+          <path d="M4.5 5.5v21" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" />
+        </svg>
+      </span>
+      <span>auto<span class="brand-accent">clips</span></span>
+    </div>
     <span class="pill">BETA</span>
   </header>
 
   <main>
     <section class="intro">
+      <div class="eyebrow"><span></span> TU ESTUDIO DE CONTENIDO</div>
       <h1>Pega la URL. <em>Salen los clips.</em></h1>
       <p>Descarga el video, detecta los cortes naturales y exporta MP4 listos para publicar.</p>
     </section>
 
-    <form id="form">
-      <input id="url" type="url" placeholder="https://www.youtube.com/watch?v=..." autocomplete="url" required />
+    <form id="form" novalidate>
+      <label class="sr-only" for="url">Enlace de YouTube</label>
+      <input
+        id="url"
+        name="url"
+        type="url"
+        placeholder="https://www.youtube.com/watch?v=..."
+        autocomplete="url"
+        spellcheck="false"
+        required
+      />
       <button type="submit" id="analyze">Analizar</button>
     </form>
-    <p id="error" class="error" role="alert"></p>
 
-    <section id="status" class="status" hidden>
+    <p id="error" class="error" role="alert"></p>
+    <p id="cookies-hint" class="hint" hidden>
+      Sin cookies ni PO tokens configurados. YouTube puede pedir verificación anti-bot.
+    </p>
+
+    <section id="status" class="status" aria-live="polite" hidden>
       <div class="bar"><div id="bar-fill"></div></div>
       <p id="status-text"></p>
     </section>
 
     <section id="video" hidden>
       <div class="video-head">
-        <img id="thumb" alt="" />
+        <img id="thumb" alt="" width="96" height="54" />
         <div>
           <h2 id="title"></h2>
           <p id="uploader" class="muted"></p>
@@ -63,6 +93,11 @@
       <h3>Clips generados</h3>
       <ul id="outputs"></ul>
     </section>
+
+    <footer class="footer">
+      <span>AutoClips · Del directo al clip</span>
+      <span>Tu contenido, bajo tu control.</span>
+    </footer>
   </main>
 </body>
 </html>

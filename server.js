@@ -8,16 +8,32 @@ import { fileURLToPath } from "node:url";
 const root = path.dirname(fileURLToPath(import.meta.url));
 const WORK = path.join(root, "work");
 const CLIPS = path.join(root, "clips");
-const PORT = Number(process.env.PORT) || 5173;
-const MAX_DURATION = 3 * 60 * 60;
-const JOB_TTL = 2 * 60 * 60 * 1000;
+
+const PORT = Number(process.env.PORT) || 8080;
+const MAX_JOBS = Math.max(1, Number(process.env.MAX_JOBS) || 1);
+const MAX_DURATION = (Number(process.env.MAX_DURATION_MIN) || 90) * 60;
+const MAX_CLIPS = Math.max(1, Number(process.env.MAX_CLIPS) || 6);
+const MAX_CLIPS_BYTES = (Number(process.env.MAX_CLIPS_GB) || 5) * 1024 ** 3;
+const MAX_CLIP_SECONDS = 180;
+const JOB_TTL = (Number(process.env.JOB_TTL_MIN) || 120) * 60 * 1000;
+const COOKIES_FILE = process.env.COOKIES_FILE || path.join(root, "cookies.txt");
+const COOKIES_BROWSER = process.env.COOKIES_BROWSER || "";
+const POT_URL = process.env.POT_URL || "";
+const YTDLP_PROXY = process.env.YTDLP_PROXY || "";
+
 const FORMAT =
   "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]/b";
+
+const jobs = new Map();
+const queue = [];
+const hits = new Map();
+let active = 0;
+let shuttingDown = false;
 
 await fs.mkdir(WORK, { recursive: true });
 await fs.mkdir(CLIPS, { recursive: true });
 
-const jobs = new Map();
+/* ---------- helpers ---------- */
 
 function run(cmd, args, { onData, timeout = 0 } = {}) {
   return new Promise((resolve) => {
@@ -54,6 +70,16 @@ function lastError(stderr) {
   return err.replace(/^ERROR:\s*/i, "").slice(0, 300);
 }
 
+function friendly(text) {
+  if (/not a bot|Sign in to confirm/i.test(text)) {
+    return "YouTube pidió verificación anti-bot. Revisa que el proveedor de PO tokens y el cookies.txt estén activos.";
+  }
+  if (/private video/i.test(text)) return "El video es privado.";
+  if (/age|confirm your age/i.test(text)) return "El video tiene restricción de edad; requiere cookies de una cuenta verificada.";
+  if (/unavailable|does not exist/i.test(text)) return "El video no está disponible en esta región o fue borrado.";
+  return text;
+}
+
 function canonicalUrl(value) {
   try {
     const raw = /^[a-z][a-z\d+.-]*:\/\//i.test(value) ? value : `https://${value}`;
@@ -73,6 +99,110 @@ function canonicalUrl(value) {
     return null;
   }
 }
+
+function isUuid(value) {
+  return /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value);
+}
+
+async function cookieArgs() {
+  try {
+    const stat = await fs.stat(COOKIES_FILE);
+    if (stat.isFile()) return ["--cookies", COOKIES_FILE];
+  } catch {}
+  return COOKIES_BROWSER ? ["--cookies-from-browser", COOKIES_BROWSER] : [];
+}
+
+async function ytArgs() {
+  const args = [
+    "--no-warnings",
+    "--no-playlist",
+    "--no-progress",
+    "--retries", "5",
+    "--fragment-retries", "10",
+    "--socket-timeout", "25",
+    "--concurrent-fragments", "4",
+    "--extractor-args", "youtube:player_client=default,tv",
+  ];
+  if (POT_URL) args.push("--extractor-args", `youtubepot-bgutilhttp:base_url=${POT_URL}`);
+  if (YTDLP_PROXY) args.push("--proxy", YTDLP_PROXY);
+  args.push(...(await cookieArgs()));
+  return args;
+}
+
+function rateLimit(max, windowMs) {
+  return (req, res, next) => {
+    const now = Date.now();
+    const key = req.ip;
+    const list = (hits.get(key) || []).filter((t) => now - t < windowMs);
+    if (list.length >= max) {
+      return res.status(429).json({ error: "Demasiadas peticiones. Espera un momento." });
+    }
+    list.push(now);
+    hits.set(key, list);
+    next();
+  };
+}
+
+function pump() {
+  while (active < MAX_JOBS && queue.length && !shuttingDown) {
+    const task = queue.shift();
+    active += 1;
+    Promise.resolve()
+      .then(() => task.run())
+      .then(task.resolve, task.reject)
+      .finally(() => {
+        active -= 1;
+        pump();
+      });
+  }
+}
+
+function enqueue(task) {
+  return new Promise((resolve, reject) => {
+    queue.push({ ...task, resolve, reject });
+    pump();
+  });
+}
+
+function queuePosition(job) {
+  return queue.findIndex((t) => t.jobId === job.id) + 1;
+}
+
+async function saveJob(job) {
+  const { dir, ...data } = job;
+  await fs.writeFile(path.join(job.dir, "job.json"), JSON.stringify(data)).catch(() => {});
+}
+
+async function loadJob(id) {
+  if (!isUuid(id)) return null;
+  try {
+    const raw = await fs.readFile(path.join(WORK, id, "job.json"), "utf8");
+    const data = JSON.parse(raw);
+    return { ...data, dir: path.join(WORK, id) };
+  } catch {
+    return null;
+  }
+}
+
+async function enforceDiskQuota() {
+  let total = 0;
+  const entries = [];
+  for (const name of await fs.readdir(CLIPS).catch(() => [])) {
+    const stat = await fs.stat(path.join(CLIPS, name)).catch(() => null);
+    if (!stat?.isFile()) continue;
+    total += stat.size;
+    entries.push({ name, size: stat.size, mtime: stat.mtimeMs });
+  }
+  if (total <= MAX_CLIPS_BYTES) return;
+  entries.sort((a, b) => a.mtime - b.mtime);
+  for (const entry of entries) {
+    if (total <= MAX_CLIPS_BYTES) break;
+    await fs.rm(path.join(CLIPS, entry.name), { force: true }).catch(() => {});
+    total -= entry.size;
+  }
+}
+
+/* ---------- análisis ---------- */
 
 function buildSegments(duration, silences, target = 30, min = 15, max = 50) {
   const points = [];
@@ -102,70 +232,63 @@ function buildSegments(duration, silences, target = 30, min = 15, max = 50) {
     cursor = end;
   }
 
-  return segments.slice(0, 10);
+  return segments.slice(0, MAX_CLIPS);
 }
 
-async function thumbnail(source, at, dir, index) {
+async function makeThumb(source, at, dir, index) {
   const out = path.join(dir, `thumb-${index}.jpg`);
   const result = await run("ffmpeg", [
     "-hide_banner", "-loglevel", "error", "-y",
     "-ss", String(at), "-i", source,
     "-frames:v", "1", "-vf", "scale=360:-2", out,
-  ]);
-  if (result.code !== 0) return null;
-  const data = await fs.readFile(out);
-  return `data:image/jpeg;base64,${data.toString("base64")}`;
+  ], { timeout: 30_000 });
+  return result.code === 0;
 }
 
 async function analyzeJob(job, url) {
   await fs.mkdir(job.dir, { recursive: true });
-
   job.status = "working";
   job.message = "Leyendo el video…";
+  await saveJob(job);
 
-  const meta = await run("yt-dlp", ["-J", "--no-warnings", "--no-playlist", url], {
-    timeout: 90_000,
-  });
-  if (meta.code !== 0) throw new Error(lastError(meta.stderr) || "No se pudo leer el video.");
+  const meta = await run("yt-dlp", ["-J", ...(await ytArgs()), url], { timeout: 90_000 });
+  if (meta.code !== 0) throw new Error(friendly(lastError(meta.stderr)) || "No se pudo leer el video.");
 
   const info = JSON.parse(meta.stdout);
-  if (info.is_live) throw new Error("Es un directo en curso. Espera a que termine y se publique.");
+  if (info.is_live) throw new Error("Es un directo en curso. Espera a que termine.");
   if (!info.duration) throw new Error("El video no tiene duración utilizable.");
-  if (info.duration > MAX_DURATION) throw new Error("El video pasa de 3 horas.");
+  if (info.duration > MAX_DURATION) {
+    throw new Error(`El video dura más de ${Math.round(MAX_DURATION / 60)} minutos.`);
+  }
 
   job.meta = {
     id: info.id,
     title: info.title,
     uploader: info.uploader,
     duration: info.duration,
-    thumbnail: info.thumbnail,
   };
+  await saveJob(job);
 
   job.message = "Descargando…";
-  const dl = await run(
-    "yt-dlp",
-    [
-      "-f", FORMAT,
-      "--merge-output-format", "mp4",
-      "--no-playlist", "--no-warnings",
-      "-o", path.join(job.dir, "source.%(ext)s"),
-      url,
-    ],
-    {
-      timeout: 30 * 60 * 1000,
-      onData: (text) => {
-        const m = text.match(/\[download\]\s+([\d.]+)%/);
-        if (m) {
-          job.progress = Number(m[1]);
-          job.message = `Descargando ${m[1]}%`;
-        }
-      },
+  const dl = await run("yt-dlp", [
+    "-f", FORMAT,
+    "--merge-output-format", "mp4",
+    ...(await ytArgs()),
+    "-o", path.join(job.dir, "source.%(ext)s"),
+    url,
+  ], {
+    timeout: 25 * 60 * 1000,
+    onData: (text) => {
+      const m = text.match(/\[download\]\s+([\d.]+)%/);
+      if (m) {
+        job.progress = Number(m[1]);
+        job.message = `Descargando ${m[1]}%`;
+      }
     },
-  );
-  if (dl.code !== 0) throw new Error(lastError(dl.stderr) || "Falló la descarga.");
+  });
+  if (dl.code !== 0) throw new Error(friendly(lastError(dl.stderr)) || "Falló la descarga.");
 
-  const files = await fs.readdir(job.dir);
-  const name = files.find((f) => f.startsWith("source."));
+  const name = (await fs.readdir(job.dir)).find((f) => f.startsWith("source."));
   if (!name) throw new Error("No se encontró el archivo descargado.");
   job.source = path.join(job.dir, name);
 
@@ -173,7 +296,7 @@ async function analyzeJob(job, url) {
   const probe = await run("ffprobe", [
     "-v", "error", "-show_entries", "format=duration",
     "-of", "default=nw=1:nk=1", job.source,
-  ]);
+  ], { timeout: 30_000 });
   const duration = Number(probe.stdout.trim()) || job.meta.duration;
 
   const silences = [];
@@ -182,6 +305,7 @@ async function analyzeJob(job, url) {
     "-af", "silencedetect=noise=-32dB:d=0.4",
     "-f", "null", "-",
   ], {
+    timeout: 15 * 60 * 1000,
     onData: (text) => {
       const s = text.match(/silence_start:\s*(-?[\d.]+)/);
       const e = text.match(/silence_end:\s*([\d.]+)/);
@@ -195,11 +319,11 @@ async function analyzeJob(job, url) {
 
   for (let i = 0; i < raw.length; i++) {
     const seg = raw[i];
+    const ok = await makeThumb(job.source, (seg.start + seg.end) / 2, job.dir, i);
     segments.push({
-      index: i,
       start: Math.round(seg.start * 10) / 10,
       end: Math.round(seg.end * 10) / 10,
-      thumb: await thumbnail(job.source, (seg.start + seg.end) / 2, job.dir, i),
+      thumb: ok ? `/api/jobs/${job.id}/thumb/${i}` : null,
     });
     job.progress = Math.round(((i + 1) / raw.length) * 100);
   }
@@ -208,7 +332,10 @@ async function analyzeJob(job, url) {
   job.status = "ready";
   job.progress = 100;
   job.message = `${segments.length} cortes sugeridos`;
+  await saveJob(job);
 }
+
+/* ---------- corte ---------- */
 
 function filterFor(format) {
   if (format === "vertical-crop") return { vf: "scale=-2:1920,crop=1080:1920" };
@@ -234,29 +361,32 @@ function slug(text) {
 }
 
 async function cutJob(job, segments, format) {
-  const f = filterFor(format);
+  const filter = filterFor(format);
   job.outputs = [];
   job.status = "cutting";
+  await saveJob(job);
 
   try {
     for (let i = 0; i < segments.length; i++) {
       const seg = segments[i];
       job.progress = Math.round((i / segments.length) * 100);
       job.message = `Cortando ${i + 1} de ${segments.length}…`;
+      await saveJob(job);
 
-      const file = `${slug(job.meta.title)}-${i + 1}.mp4`;
+      const file = `${slug(job.meta.title)}-${job.id.slice(0, 6)}-${i + 1}.mp4`;
       const out = path.join(CLIPS, file);
 
       const args = ["-hide_banner", "-loglevel", "error", "-y", "-i", job.source,
         "-ss", String(seg.start), "-t", String(seg.end - seg.start)];
 
-      if (f.complex) args.push("-filter_complex", f.complex, "-map", "[v]", "-map", "0:a?");
-      else if (f.vf) args.push("-vf", f.vf, "-map", "0:v:0", "-map", "0:a?");
+      if (filter.complex) args.push("-filter_complex", filter.complex, "-map", "[v]", "-map", "0:a?");
+      else if (filter.vf) args.push("-vf", filter.vf, "-map", "0:v:0", "-map", "0:a?");
       else args.push("-map", "0:v:0", "-map", "0:a?");
 
       args.push(
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+        "-maxrate", "6M", "-bufsize", "12M",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k",
         "-movflags", "+faststart", out,
       );
 
@@ -275,40 +405,42 @@ async function cutJob(job, segments, format) {
     job.status = "done";
     job.progress = 100;
     job.message = `${job.outputs.length} clips listos`;
+    await saveJob(job);
+    await enforceDiskQuota();
   } catch (err) {
     job.status = "error";
     job.message = err.message;
+    await saveJob(job);
   }
 }
 
+/* ---------- app ---------- */
+
 const app = express();
-app.use(express.json({ limit: "1mb" }));
-app.use(express.static(path.join(root, "public")));
-app.use("/clips", express.static(CLIPS));
+app.set("trust proxy", 1);
+app.disable("x-powered-by");
 
-app.post("/api/analyze", async (req, res) => {
-  const url = canonicalUrl(String(req.body?.url ?? "").trim());
-  if (!url) return res.status(400).json({ error: "Enlace de YouTube no válido." });
-
-  const job = {
-    id: randomUUID(),
-    status: "queued",
-    progress: 0,
-    message: "En cola",
-    createdAt: Date.now(),
-    dir: path.join(WORK, randomUUID()),
-  };
-  jobs.set(job.id, job);
-
-  res.json({ jobId: job.id });
-  analyzeJob(job, url).catch((err) => {
-    job.status = "error";
-    job.message = err.message;
-  });
+app.use((_req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("X-Frame-Options", "SAMEORIGIN");
+  next();
 });
 
-app.get("/api/jobs/:id", (req, res) => {
-  const job = jobs.get(req.params.id);
+app.use(express.json({ limit: "100kb" }));
+app.use(express.static(path.join(root, "public"), { maxAge: "1h" }));
+
+app.get("/healthz", (_req, res) => {
+  res.json({ ok: !shuttingDown, active, queued: queue.length, uptime: process.uptime() });
+});
+
+app.get("/api/config", async (_req, res) => {
+  const cookies = await cookieArgs();
+  res.json({ cookies: cookies.length > 0, pot: Boolean(POT_URL), maxClips: MAX_CLIPS });
+});
+
+app.get("/api/jobs/:id", async (req, res) => {
+  const job = jobs.get(req.params.id) || (await loadJob(req.params.id));
   if (!job) return res.status(404).json({ error: "Trabajo no encontrado." });
 
   res.json({
@@ -319,12 +451,56 @@ app.get("/api/jobs/:id", (req, res) => {
     meta: job.meta,
     segments: job.segments,
     outputs: job.outputs,
+    position: job.status === "queued" ? queuePosition(job) : 0,
   });
 });
 
-app.post("/api/jobs/:id/cut", (req, res) => {
+app.get("/api/jobs/:id/thumb/:index", async (req, res) => {
+  if (!isUuid(req.params.id)) return res.status(404).end();
+  const index = Number(req.params.index);
+  if (!Number.isInteger(index) || index < 0 || index >= MAX_CLIPS) return res.status(404).end();
+  res.sendFile(path.join(WORK, req.params.id, `thumb-${index}.jpg`), {
+    maxAge: "1h",
+  }, (err) => err && !res.headersSent && res.status(404).end());
+});
+
+app.post("/api/analyze", rateLimit(10, 10 * 60 * 1000), async (req, res) => {
+  if (shuttingDown) return res.status(503).json({ error: "Servidor reiniciándose." });
+  if (queue.length >= 30) return res.status(503).json({ error: "Cola llena. Prueba en un rato." });
+
+  const url = canonicalUrl(String(req.body?.url ?? "").trim());
+  if (!url) return res.status(400).json({ error: "Enlace de YouTube no válido." });
+
+  const id = randomUUID();
+  const job = {
+    id,
+    status: "queued",
+    progress: 0,
+    message: "En cola",
+    createdAt: Date.now(),
+    dir: path.join(WORK, id),
+  };
+  jobs.set(id, job);
+  await fs.mkdir(job.dir, { recursive: true });
+  await saveJob(job);
+
+  res.json({ jobId: id, position: queue.length + 1 });
+
+  const task = {
+    jobId: id,
+    run: () => analyzeJob(job, url),
+  };
+  enqueue(task).catch(async (err) => {
+    job.status = "error";
+    job.message = err.message;
+    await saveJob(job);
+  });
+});
+
+app.post("/api/jobs/:id/cut", rateLimit(20, 10 * 60 * 1000), async (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job?.source) return res.status(404).json({ error: "Trabajo no encontrado o sin archivo." });
+  if (job.status === "cutting") return res.status(409).json({ error: "Ya se está cortando." });
 
   const format = ["original", "vertical-crop", "vertical-blur"].includes(req.body?.format)
     ? req.body.format
@@ -332,25 +508,91 @@ app.post("/api/jobs/:id/cut", (req, res) => {
 
   const segments = (req.body?.segments || [])
     .map((s) => ({ start: Math.max(0, Number(s.start)), end: Number(s.end) }))
-    .filter((s) => Number.isFinite(s.start) && Number.isFinite(s.end) && s.end - s.start >= 1)
-    .slice(0, 10);
+    .filter((s) =>
+      Number.isFinite(s.start) && Number.isFinite(s.end)
+      && s.end - s.start >= 1
+      && s.end - s.start <= MAX_CLIP_SECONDS
+      && s.start < job.meta.duration)
+    .slice(0, MAX_CLIPS);
 
-  if (!segments.length) return res.status(400).json({ error: "No hay cortes válidos." });
+  if (!segments.length) {
+    return res.status(400).json({
+      error: `Marca al menos un corte válido (entre 1 y ${MAX_CLIP_SECONDS} segundos).`,
+    });
+  }
 
   res.json({ ok: true });
-  cutJob(job, segments, format);
+  enqueue({ jobId: job.id, run: () => cutJob(job, segments, format) }).catch(() => {});
 });
+
+app.get("/clips/:file", (req, res) => {
+  const file = path.basename(req.params.file);
+  if (!/\.mp4$/.test(file)) return res.status(404).end();
+  res.download(path.join(CLIPS, file), file, (err) => {
+    if (err && !res.headersSent) res.status(404).end();
+  });
+});
+
+app.use((_req, res) => res.status(404).json({ error: "Ruta no encontrada." }));
+
+/* ---------- limpieza ---------- */
 
 setInterval(() => {
   const now = Date.now();
+
+  for (const [ip, list] of hits) {
+    const alive = list.filter((t) => now - t < 10 * 60 * 1000);
+    if (alive.length) hits.set(ip, alive);
+    else hits.delete(ip);
+  }
+
   for (const [id, job] of jobs) {
-    if (now - job.createdAt > JOB_TTL && job.status !== "cutting") {
+    const busy = ["queued", "working", "cutting"].includes(job.status);
+    if (!busy && now - job.createdAt > JOB_TTL) {
       jobs.delete(id);
       fs.rm(job.dir, { recursive: true, force: true }).catch(() => {});
     }
   }
-}, 10 * 60 * 1000);
+}, 5 * 60 * 1000);
 
-app.listen(PORT, "127.0.0.1", () => {
-  console.log(`\n  AutoClips en http://127.0.0.1:${PORT}\n`);
+async function cleanWorkOnBoot() {
+  const cutoff = Date.now() - JOB_TTL;
+  for (const name of await fs.readdir(WORK).catch(() => [])) {
+    const stat = await fs.stat(path.join(WORK, name)).catch(() => null);
+    if (stat && stat.mtimeMs < cutoff) {
+      await fs.rm(path.join(WORK, name), { recursive: true, force: true }).catch(() => {});
+    }
+  }
+}
+
+/* ---------- arranque ---------- */
+
+for (const bin of ["yt-dlp", "ffmpeg", "ffprobe"]) {
+  const check = await run(bin, [bin === "yt-dlp" ? "--version" : "-version"]);
+  if (check.code !== 0) {
+    console.error(`\n  Falta "${bin}" en el PATH.\n`);
+    process.exit(1);
+  }
+}
+
+await cleanWorkOnBoot();
+await enforceDiskQuota();
+
+const server = app.listen(PORT, "0.0.0.0", () => {
+  console.log(`AutoClips escuchando en :${PORT} · concurrencia ${MAX_JOBS} · PO token ${POT_URL ? "sí" : "no"}`);
 });
+
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal}: cerrando…`);
+  server.close();
+  const deadline = Date.now() + 25_000;
+  while (active > 0 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
