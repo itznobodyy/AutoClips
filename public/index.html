@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AutoClips</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <div class="brand">auto<span>clips</span></div>
+    <span class="pill">BETA</span>
+  </header>
+
+  <main>
+    <section class="intro">
+      <h1>Pega la URL. <em>Salen los clips.</em></h1>
+      <p>Descarga el video, detecta los cortes naturales y exporta MP4 listos para publicar.</p>
+    </section>
+
+    <form id="form">
+      <input id="url" type="url" placeholder="https://www.youtube.com/watch?v=..." autocomplete="url" required />
+      <button type="submit" id="analyze">Analizar</button>
+    </form>
+    <p id="error" class="error" role="alert"></p>
+
+    <section id="status" class="status" hidden>
+      <div class="bar"><div id="bar-fill"></div></div>
+      <p id="status-text"></p>
+    </section>
+
+    <section id="video" hidden>
+      <div class="video-head">
+        <img id="thumb" alt="" />
+        <div>
+          <h2 id="title"></h2>
+          <p id="uploader" class="muted"></p>
+        </div>
+      </div>
+      <div id="frame"></div>
+    </section>
+
+    <section id="editor" hidden>
+      <div class="editor-head">
+        <h3>Cortes sugeridos</h3>
+        <button id="add" class="ghost" type="button">+ Añadir corte manual</button>
+      </div>
+      <ul id="segments"></ul>
+
+      <div class="export">
+        <label for="format">Formato de salida</label>
+        <select id="format">
+          <option value="original">Horizontal (original)</option>
+          <option value="vertical-crop">Vertical 9:16 (recorte)</option>
+          <option value="vertical-blur">Vertical 9:16 (fondo desenfocado)</option>
+        </select>
+        <button id="cut" type="button">Generar clips</button>
+      </div>
+    </section>
+
+    <section id="results" hidden>
+      <h3>Clips generados</h3>
+      <ul id="outputs"></ul>
+    </section>
+  </main>
+</body>
+</html>
