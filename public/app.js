@@ -1,6 +1,8 @@
 const form = document.querySelector("#form");
 const urlInput = document.querySelector("#url");
 const analyzeBtn = document.querySelector("#analyze");
+const fileInput = document.querySelector("#file-input");
+const fileName = document.querySelector("#file-name");
 const errorBox = document.querySelector("#error");
 const cookiesHint = document.querySelector("#cookies-hint");
 const statusBox = document.querySelector("#status");
@@ -25,20 +27,34 @@ let poll = null;
 let maxClips = 6;
 
 fetch("/api/config")
-  .then((response) => response.json())
+  .then((r) => r.json())
   .then((config) => {
     cookiesHint.hidden = config.cookies && config.pot;
     if (Number(config.maxClips) > 0) maxClips = Number(config.maxClips);
   })
   .catch(() => {});
 
-function showError(text) {
-  errorBox.textContent = text;
-}
+/* ---- file picker label ---- */
+fileInput.addEventListener("change", () => {
+  const file = fileInput.files[0];
+  fileName.textContent = file ? file.name : "";
+  if (file) {
+    urlInput.value = "";
+    clearError();
+  }
+});
 
-function clearError() {
-  errorBox.textContent = "";
-}
+urlInput.addEventListener("input", () => {
+  if (urlInput.value) {
+    fileInput.value = "";
+    fileName.textContent = "";
+  }
+  if (errorBox.textContent) clearError();
+});
+
+/* ---- helpers ---- */
+function showError(text) { errorBox.textContent = text; }
+function clearError() { errorBox.textContent = ""; }
 
 function setProgress(value, text) {
   statusBox.hidden = false;
@@ -48,8 +64,8 @@ function setProgress(value, text) {
 
 function toSeconds(value) {
   const parts = String(value).split(":").map(Number);
-  if (parts.some((part) => Number.isNaN(part))) return 0;
-  return parts.reduce((acc, part) => acc * 60 + part, 0);
+  if (parts.some((p) => Number.isNaN(p))) return 0;
+  return parts.reduce((acc, p) => acc * 60 + p, 0);
 }
 
 function toClock(value) {
@@ -58,6 +74,7 @@ function toClock(value) {
 }
 
 function preview(start) {
+  if (!videoId || videoId === jobId) return; // uploaded file — no YouTube embed
   frame.innerHTML = "";
   const iframe = document.createElement("iframe");
   iframe.src = `https://www.youtube-nocookie.com/embed/${videoId}?start=${Math.floor(start)}&autoplay=1`;
@@ -143,24 +160,38 @@ function resetView() {
   cutBtn.disabled = false;
 }
 
+/* ---- URL submit ---- */
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
+
+  const file = fileInput.files[0];
+  const url = urlInput.value.trim();
+
+  if (!file && !url) {
+    showError("Pega un enlace o selecciona un archivo de video.");
+    return;
+  }
+
   resetView();
   analyzeBtn.disabled = true;
-  setProgress(2, "Enviando…");
 
+  if (file) {
+    await submitFile(file);
+  } else {
+    await submitUrl(url);
+  }
+});
+
+async function submitUrl(url) {
+  setProgress(2, "Enviando…");
   try {
-    const response = await fetch("/api/analyze", {
+    const res = await fetch("/api/analyze", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: urlInput.value }),
+      body: JSON.stringify({ url }),
     });
-    const data = await response.json().catch(() => ({}));
-
-    if (!response.ok) {
-      throw new Error(data.error || "No se pudo analizar el enlace.");
-    }
-
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || "No se pudo analizar el enlace.");
     jobId = data.jobId;
     if (data.position > 1) setProgress(3, `En cola · posición ${data.position}`);
     poll = setInterval(check, 1300);
@@ -169,20 +200,61 @@ form.addEventListener("submit", async (event) => {
     showError(err.message);
     analyzeBtn.disabled = false;
   }
-});
+}
 
+async function submitFile(file) {
+  setProgress(2, "Subiendo archivo…");
+
+  const formData = new FormData();
+  formData.append("video", file);
+
+  try {
+    // Track upload progress with XHR so the bar moves during the transfer
+    const data = await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "/api/upload");
+      xhr.upload.addEventListener("progress", (e) => {
+        if (e.lengthComputable) {
+          const pct = Math.round((e.loaded / e.total) * 90);
+          setProgress(pct, `Subiendo… ${pct}%`);
+        }
+      });
+      xhr.addEventListener("load", () => {
+        try {
+          const json = JSON.parse(xhr.responseText);
+          if (xhr.status >= 400) reject(new Error(json.error || "Error al subir el archivo."));
+          else resolve(json);
+        } catch {
+          reject(new Error("Respuesta inesperada del servidor."));
+        }
+      });
+      xhr.addEventListener("error", () => reject(new Error("No se pudo conectar con el servidor.")));
+      xhr.send(formData);
+    });
+
+    jobId = data.jobId;
+    if (data.position > 1) setProgress(91, `En cola · posición ${data.position}`);
+    poll = setInterval(check, 1300);
+  } catch (err) {
+    statusBox.hidden = true;
+    showError(err.message);
+    analyzeBtn.disabled = false;
+  }
+}
+
+/* ---- polling ---- */
 async function check() {
   try {
-    const response = await fetch(`/api/jobs/${jobId}`);
-    if (response.status === 404) {
+    const res = await fetch(`/api/jobs/${jobId}`);
+    if (res.status === 404) {
       clearInterval(poll);
       statusBox.hidden = true;
-      showError("El trabajo caducó. Vuelve a analizar el enlace.");
+      showError("El trabajo caducó. Vuelve a analizar.");
       analyzeBtn.disabled = false;
       return;
     }
 
-    const job = await response.json();
+    const job = await res.json();
 
     if (job.status === "queued" && job.position > 0) {
       setProgress(3, `En cola · posición ${job.position}`);
@@ -194,8 +266,13 @@ async function check() {
     }
 
     if (job.meta && !videoId) {
+      // For YouTube jobs the id is an 11-char video id; for uploads it's the job UUID
       videoId = job.meta.id;
-      thumb.src = job.meta.thumbnail || `https://i.ytimg.com/vi/${job.meta.id}/hqdefault.jpg`;
+      const isYouTube = /^[A-Za-z0-9_-]{11}$/.test(videoId);
+      thumb.src = isYouTube
+        ? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`
+        : "";
+      thumb.hidden = !isYouTube;
       title.textContent = job.meta.title;
       uploader.textContent = job.meta.uploader || "";
       videoBox.hidden = false;
@@ -248,27 +325,28 @@ async function check() {
   }
 }
 
+/* ---- manual cut row ---- */
 addBtn.addEventListener("click", () => {
-  if (!videoId) return;
+  if (!jobId) return;
   clearError();
   addRow({ start: 0, end: 20, thumb: null });
 });
 
+/* ---- generate clips ---- */
 cutBtn.addEventListener("click", async () => {
   clearError();
 
   const segments = [...list.querySelectorAll(".segment")]
     .map((li) => {
-      const inputs = li.querySelectorAll('input[type="checkbox"], input:not([type="checkbox"])');
       const check = li.querySelector('input[type="checkbox"]');
-      const [start, end] = li.querySelectorAll('.times input');
+      const [start, end] = li.querySelectorAll(".times input");
       return {
         checked: check?.checked ?? false,
         start: toSeconds(start?.value ?? "0"),
         end: toSeconds(end?.value ?? "0"),
       };
     })
-    .filter((segment) => segment.checked && segment.end - segment.start >= 1)
+    .filter((s) => s.checked && s.end - s.start >= 1)
     .map(({ start, end }) => ({ start, end }));
 
   if (!segments.length) {
@@ -280,25 +358,17 @@ cutBtn.addEventListener("click", async () => {
   setProgress(1, "Enviando cortes…");
 
   try {
-    const response = await fetch(`/api/jobs/${jobId}/cut`, {
+    const res = await fetch(`/api/jobs/${jobId}/cut`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ segments, format: formatSelect.value }),
     });
-    const data = await response.json().catch(() => ({}));
-
-    if (!response.ok) {
-      throw new Error(data.error || "No se pudo iniciar el corte.");
-    }
-
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || "No se pudo iniciar el corte.");
     poll = setInterval(check, 1500);
   } catch (err) {
     statusBox.hidden = true;
     showError(err.message);
     cutBtn.disabled = false;
   }
-});
-
-urlInput.addEventListener("input", () => {
-  if (errorBox.textContent) clearError();
 });

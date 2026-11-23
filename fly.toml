@@ -1,0 +1,38 @@
+app = "autoclips"
+primary_region = "mad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT          = "8080"
+  MAX_JOBS      = "1"
+  MAX_DURATION_MIN = "90"
+  MAX_CLIPS     = "6"
+  MAX_CLIPS_GB  = "5"
+  JOB_TTL_MIN   = "120"
+  NODE_ENV      = "production"
+
+[http_service]
+  internal_port       = 8080
+  force_https         = true
+  auto_stop_machines  = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type       = "requests"
+    hard_limit = 10
+    soft_limit = 5
+
+[[mounts]]
+  source      = "autoclips_clips"
+  destination = "/app/clips"
+
+[[mounts]]
+  source      = "autoclips_work"
+  destination = "/app/work"
+
+[[vm]]
+  size   = "shared-cpu-2x"
+  memory = "512mb"

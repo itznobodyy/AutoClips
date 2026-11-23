@@ -45,10 +45,22 @@
         placeholder="https://www.youtube.com/watch?v=..."
         autocomplete="url"
         spellcheck="false"
-        required
       />
       <button type="submit" id="analyze">Analizar</button>
     </form>
+
+    <div class="upload-row">
+      <span class="upload-sep">o bien</span>
+      <label class="upload-label" for="file-input">
+        <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+          <path d="M10 3v10M6 7l4-4 4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M3 14v1a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-1" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+        </svg>
+        Subir video propio
+      </label>
+      <input id="file-input" type="file" accept="video/*" class="sr-only" />
+      <span id="file-name" class="file-name"></span>
+    </div>
 
     <p id="error" class="error" role="alert"></p>
     <p id="cookies-hint" class="hint" hidden>

@@ -1,6 +1,8 @@
 import express from "express";
+import multer from "multer";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
+import { createReadStream } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -8,6 +10,14 @@ import { fileURLToPath } from "node:url";
 const root = path.dirname(fileURLToPath(import.meta.url));
 const WORK = path.join(root, "work");
 const CLIPS = path.join(root, "clips");
+const UPLOADS = path.join(root, "uploads");
+
+const MAX_UPLOAD_BYTES = (Number(process.env.MAX_UPLOAD_GB) || 2) * 1024 ** 3;
+const ALLOWED_VIDEO_MIME = new Set([
+  "video/mp4", "video/quicktime", "video/x-matroska", "video/webm",
+  "video/avi", "video/x-msvideo", "video/mpeg", "video/x-ms-wmv",
+  "video/3gpp", "video/x-flv",
+]);
 
 const PORT = Number(process.env.PORT) || 8080;
 const MAX_JOBS = Math.max(1, Number(process.env.MAX_JOBS) || 1);
@@ -32,6 +42,7 @@ let shuttingDown = false;
 
 await fs.mkdir(WORK, { recursive: true });
 await fs.mkdir(CLIPS, { recursive: true });
+await fs.mkdir(UPLOADS, { recursive: true });
 
 /* ---------- helpers ---------- */
 
@@ -172,6 +183,18 @@ async function saveJob(job) {
   const { dir, ...data } = job;
   await fs.writeFile(path.join(job.dir, "job.json"), JSON.stringify(data)).catch(() => {});
 }
+
+/* ---------- multer ---------- */
+
+const upload = multer({
+  dest: UPLOADS,
+  limits: { fileSize: MAX_UPLOAD_BYTES, files: 1 },
+  fileFilter(_req, file, cb) {
+    const ok = ALLOWED_VIDEO_MIME.has(file.mimetype);
+    cb(ok ? null : new Error("Formato de archivo no admitido."), ok);
+  },
+});
+
 
 async function loadJob(id) {
   if (!isUuid(id)) return null;
@@ -335,6 +358,80 @@ async function analyzeJob(job, url) {
   await saveJob(job);
 }
 
+async function analyzeFileJob(job, uploadPath, originalName) {
+  await fs.mkdir(job.dir, { recursive: true });
+  job.status = "working";
+  job.message = "Moviendo el archivo…";
+  await saveJob(job);
+
+  const ext = path.extname(originalName).toLowerCase() || ".mp4";
+  const dest = path.join(job.dir, `source${ext}`);
+  await fs.rename(uploadPath, dest);
+  job.source = dest;
+
+  job.message = "Leyendo el video…";
+  const probe = await run("ffprobe", [
+    "-v", "error",
+    "-show_entries", "format=duration:format_tags=title",
+    "-of", "json",
+    dest,
+  ], { timeout: 30_000 });
+
+  if (probe.code !== 0) throw new Error("No se pudo leer el archivo de video.");
+
+  let duration = 0;
+  let title = path.basename(originalName, ext);
+  try {
+    const info = JSON.parse(probe.stdout);
+    duration = Number(info?.format?.duration) || 0;
+    title = info?.format?.tags?.title || title;
+  } catch {}
+
+  if (!duration) throw new Error("El archivo no tiene duración utilizable.");
+  if (duration > MAX_DURATION) {
+    throw new Error(`El video dura más de ${Math.round(MAX_DURATION / 60)} minutos.`);
+  }
+
+  job.meta = { id: job.id, title, uploader: "Archivo local", duration };
+  await saveJob(job);
+
+  job.message = "Analizando el audio…";
+  const silences = [];
+  await run("ffmpeg", [
+    "-hide_banner", "-i", dest,
+    "-af", "silencedetect=noise=-32dB:d=0.4",
+    "-f", "null", "-",
+  ], {
+    timeout: 15 * 60 * 1000,
+    onData: (text) => {
+      const s = text.match(/silence_start:\s*(-?[\d.]+)/);
+      const e = text.match(/silence_end:\s*([\d.]+)/);
+      if (s) silences.push({ start: Math.max(0, Number(s[1])) });
+      if (e && silences.length) silences.at(-1).end = Number(e[1]);
+    },
+  });
+
+  const raw = buildSegments(duration, silences);
+  const segments = [];
+
+  for (let i = 0; i < raw.length; i++) {
+    const seg = raw[i];
+    const ok = await makeThumb(dest, (seg.start + seg.end) / 2, job.dir, i);
+    segments.push({
+      start: Math.round(seg.start * 10) / 10,
+      end: Math.round(seg.end * 10) / 10,
+      thumb: ok ? `/api/jobs/${job.id}/thumb/${i}` : null,
+    });
+    job.progress = Math.round(((i + 1) / raw.length) * 100);
+  }
+
+  job.segments = segments;
+  job.status = "ready";
+  job.progress = 100;
+  job.message = `${segments.length} cortes sugeridos`;
+  await saveJob(job);
+}
+
 /* ---------- corte ---------- */
 
 function filterFor(format) {
@@ -424,6 +521,20 @@ app.use((_req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
   res.setHeader("X-Frame-Options", "SAMEORIGIN");
+  res.setHeader(
+    "Content-Security-Policy",
+    [
+      "default-src 'self'",
+      "script-src 'self'",
+      "style-src 'self' https://fonts.googleapis.com",
+      "font-src https://fonts.gstatic.com",
+      "img-src 'self' https://i.ytimg.com data:",
+      "frame-src https://www.youtube-nocookie.com",
+      "connect-src 'self'",
+      "object-src 'none'",
+      "base-uri 'self'",
+    ].join("; "),
+  );
   next();
 });
 
@@ -497,6 +608,55 @@ app.post("/api/analyze", rateLimit(10, 10 * 60 * 1000), async (req, res) => {
   });
 });
 
+app.post(
+  "/api/upload",
+  rateLimit(5, 10 * 60 * 1000),
+  (req, res, next) => {
+    if (shuttingDown) return res.status(503).json({ error: "Servidor reiniciándose." });
+    if (queue.length >= 30) return res.status(503).json({ error: "Cola llena. Prueba en un rato." });
+    next();
+  },
+  (req, res, next) => {
+    upload.single("video")(req, res, (err) => {
+      if (err) {
+        return res.status(400).json({
+          error: err.message || "Error al subir el archivo.",
+        });
+      }
+      next();
+    });
+  },
+  async (req, res) => {
+    if (!req.file) return res.status(400).json({ error: "No se recibió ningún archivo." });
+
+    const id = randomUUID();
+    const job = {
+      id,
+      status: "queued",
+      progress: 0,
+      message: "En cola",
+      createdAt: Date.now(),
+      dir: path.join(WORK, id),
+    };
+    jobs.set(id, job);
+    await fs.mkdir(job.dir, { recursive: true });
+    await saveJob(job);
+
+    res.json({ jobId: id, position: queue.length + 1 });
+
+    const uploadPath = req.file.path;
+    const originalName = req.file.originalname || "video.mp4";
+    enqueue({ jobId: id, run: () => analyzeFileJob(job, uploadPath, originalName) }).catch(
+      async (err) => {
+        job.status = "error";
+        job.message = err.message;
+        await saveJob(job);
+        await fs.rm(uploadPath, { force: true }).catch(() => {});
+      },
+    );
+  },
+);
+
 app.post("/api/jobs/:id/cut", rateLimit(20, 10 * 60 * 1000), async (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job?.source) return res.status(404).json({ error: "Trabajo no encontrado o sin archivo." });
@@ -561,6 +721,13 @@ async function cleanWorkOnBoot() {
     const stat = await fs.stat(path.join(WORK, name)).catch(() => null);
     if (stat && stat.mtimeMs < cutoff) {
       await fs.rm(path.join(WORK, name), { recursive: true, force: true }).catch(() => {});
+    }
+  }
+  // Clean up stale multer temp files
+  for (const name of await fs.readdir(UPLOADS).catch(() => [])) {
+    const stat = await fs.stat(path.join(UPLOADS, name)).catch(() => null);
+    if (stat && stat.mtimeMs < cutoff) {
+      await fs.rm(path.join(UPLOADS, name), { force: true }).catch(() => {});
     }
   }
 }

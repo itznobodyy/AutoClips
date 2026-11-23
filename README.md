@@ -1,57 +1,100 @@
 # AutoClips
 
-**Un reproductor ligero para abrir videos de YouTube desde una sola página.**
-
-AutoClips es un prototipo web estático que permite pegar un enlace de YouTube y reproducirlo en un reproductor integrado cuando el video admite inserción.
-
-> **Estado del proyecto:** prototipo. AutoClips no descarga, analiza ni edita videos, y todavía no genera clips ni subtítulos.
+Convierte un video en clips MP4 listos para publicar. Pega un enlace de YouTube **o sube tu propio archivo de video**, elige los cortes y descarga los MP4.
 
 ## Funcionalidades
 
-- Reproduce enlaces de videos, Shorts y directos de YouTube.
-- Reconoce formatos comunes como `youtube.com/watch`, `youtube.com/live`, `youtube.com/shorts`, `youtu.be` y YouTube Music.
-- Valida el enlace antes de cargar el reproductor.
-- Incluye un enlace para abrir el video directamente en YouTube si no se puede insertar.
-- Diseño adaptable a pantallas móviles y de escritorio.
+- **Subida de archivo propio** (MP4, MKV, MOV, WebM…) — sin dependencia de YouTube.
+- **Enlace de YouTube** — compatible con `watch`, `live`, `shorts`, `youtu.be` y YouTube Music.
+- Detección automática de silencios para sugerir puntos de corte.
+- Editor de segmentos con miniaturas, tiempos ajustables y vista previa.
+- Exportación en horizontal (original), vertical 9:16 con recorte o con fondo desenfocado.
+- Cola de trabajos en segundo plano con barra de progreso en tiempo real.
+- Rotación automática del disco cuando se alcanza el límite de almacenamiento.
 
-La reproducción está sujeta a la disponibilidad del video y a la configuración de YouTube. Los videos privados, restringidos o con la inserción desactivada pueden no reproducirse en AutoClips.
+## Aviso sobre YouTube
 
-## Ejecutar localmente
+yt-dlp puede fallar con URLs de YouTube cuando el servidor es detectado como bot por las protecciones de la plataforma. Si necesitas procesar contenido propio alojado en YouTube, descárgalo primero en tu dispositivo y súbelo con la opción de archivo. Respeta los términos de servicio de cada plataforma y los derechos de autor.
 
-Se requiere Python 3 para servir la página localmente. No hay dependencias de Node ni pasos de compilación.
-
-Desde PowerShell, en la carpeta del proyecto:
-
-```powershell
-python -m http.server 8000 --bind 127.0.0.1
-```
-
-Abre [http://127.0.0.1:8000](http://127.0.0.1:8000) en el navegador. Mantén abierta la terminal mientras uses la página; para detener el servidor, presiona `Ctrl+C`.
-
-> No abras `index.html` directamente como archivo: YouTube necesita que la página se sirva mediante HTTP para que el reproductor integrado funcione correctamente.
-
-## Comandos de producción
-
-Con GNU Make y SSH instalados en tu PC, puedes administrar un servidor ya configurado con el servicio `autoclips`:
+## Ejecutar localmente con Docker
 
 ```sh
-make deploy HOST=root@tu-servidor
-make logs HOST=root@tu-servidor
-make logs HOST=root@tu-servidor SERVICE=pot
+docker compose up --build
+```
+
+Abre [http://localhost:8080](http://localhost:8080).
+
+Para pasar cookies de YouTube (opcional):
+
+```sh
+make cookies HOST=root@tu-servidor COOKIE_FILE=secrets/cookies.txt
+```
+
+## Despliegue en Fly.io (sin VPS)
+
+### Requisitos
+
+- Cuenta en [fly.io](https://fly.io)
+- `flyctl` instalado
+
+### Pasos
+
+```sh
+# 1. Autenticarse
+flyctl auth login
+
+# 2. Crear la app (solo la primera vez)
+flyctl apps create autoclips
+
+# 3. Crear volúmenes persistentes (solo la primera vez)
+flyctl volumes create autoclips_clips --size 10 --region mad
+flyctl volumes create autoclips_work  --size 10 --region mad
+
+# 4. Desplegar
+flyctl deploy
+```
+
+### Variables de entorno opcionales
+
+Configúralas como secrets para que no queden en el repositorio:
+
+```sh
+flyctl secrets set POT_URL="http://..." YTDLP_PROXY="socks5://..."
+```
+
+| Variable | Descripción | Valor por defecto |
+|---|---|---|
+| `MAX_JOBS` | Trabajos en paralelo | `1` |
+| `MAX_DURATION_MIN` | Duración máxima del video (minutos) | `90` |
+| `MAX_CLIPS` | Clips máximos por trabajo | `6` |
+| `MAX_CLIPS_GB` | Espacio máximo para clips (GB) | `5` |
+| `MAX_UPLOAD_GB` | Tamaño máximo de archivo subido (GB) | `2` |
+| `JOB_TTL_MIN` | Tiempo de vida de un trabajo (minutos) | `120` |
+| `POT_URL` | URL del servidor de PO tokens | — |
+| `COOKIES_FILE` | Ruta al fichero `cookies.txt` de YouTube | — |
+| `YTDLP_PROXY` | Proxy para yt-dlp | — |
+
+## Comandos de gestión remota
+
+```sh
+make deploy  HOST=root@tu-servidor
+make logs    HOST=root@tu-servidor
 make restart HOST=root@tu-servidor
 make cookies HOST=root@tu-servidor COOKIE_FILE=secrets/cookies.txt
 ```
 
-`deploy` actualiza el checkout remoto y recarga el servicio; `cookies` instala el archivo con permisos privados y reinicia AutoClips. `secrets/` está excluido de Git. Estos comandos presuponen que el servidor ya tiene configurados Docker Compose y el servicio systemd de AutoClips.
-
 ## Estructura
 
 | Archivo | Descripción |
-| --- | --- |
-| `index.html` | Estructura de la página y reproductor |
-| `styles.css` | Diseño adaptable y estilos |
-| `app.js` | Validación de enlaces y carga del video |
+|---|---|
+| `server.js` | Backend Express: análisis, subida, corte, cola |
+| `public/index.html` | Interfaz de usuario |
+| `public/app.js` | Lógica del cliente |
+| `public/styles.css` | Estilos |
+| `Dockerfile` | Imagen con Node, FFmpeg y yt-dlp |
+| `docker-compose.yml` | Entorno local con servidor de PO tokens |
+| `fly.toml` | Configuración de despliegue en Fly.io |
 
 ## Privacidad
 
-AutoClips no tiene backend ni almacena videos. Al cargar un reproductor o abrir un enlace, el navegador se comunica directamente con YouTube y se aplican las políticas de privacidad de Google/YouTube.
+Los archivos subidos y los clips generados se eliminan automáticamente tras el tiempo de vida configurado (`JOB_TTL_MIN`). No se almacena ningún dato de usuario ni se comparte con terceros.

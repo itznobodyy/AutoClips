@@ -7,7 +7,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg python3 python3-pip curl ca-certificates tini \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+# Pin yt-dlp to a specific release to avoid unexpected breakage on redeploy
+RUN curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/download/2025.06.09/yt-dlp \
       -o /usr/local/bin/yt-dlp && chmod +x /usr/local/bin/yt-dlp
 
 RUN pip3 install --no-cache-dir --break-system-packages \
@@ -18,7 +19,7 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 COPY . .
 
-RUN mkdir -p work clips && chown -R node:node /app
+RUN mkdir -p work clips uploads && chown -R node:node /app
 USER node
 
 EXPOSE 8080
